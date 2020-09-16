@@ -1,0 +1,291 @@
+#! /usr/bin/python3
+
+import socket
+from bcc import BPF, lib
+import sys, getopt
+import ctypes
+
+class ADDR(ctypes.Union):
+    _fields_ = [
+            ("v4_addr", ctypes.c_int32),
+            ("v6_addr", ctypes.c_ubyte * 18),
+            ]
+class IP_KEY(ctypes.Structure):
+    _fields_ = [
+            ("addr", ADDR),
+            ("family", ctypes.c_uint8),
+            ]
+class PORT_KEY(ctypes.Structure):
+    _fields_ = [
+            ("port", ctypes.c_uint16),
+            ("family", ctypes.c_ubyte),
+            ]
+IPV4_FAMILY = ctypes.c_uint8(1)
+IPV6_FAMILY = ctypes.c_uint8(2)
+EGRESS = ctypes.c_uint8(1)
+INGRESS = ctypes.c_uint8(2)
+PORT_UDP = ctypes.c_uint8(1)
+PORT_TCP = ctypes.c_uint8(2)
+ALLOW = ctypes.c_uint8(1)
+BLOCK= ctypes.c_uint8(2)
+
+bpf_text = """
+#define KBUILD_MODNAME "fastdrop"
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+#include <linux/types.h>
+
+#define EGRESS 1
+#define INGRESS 2
+
+#define IPV4_FAMILY 1
+#define IPV6_FAMILY 2
+
+#define PORT_UDP 1
+#define PORT_TCP 2
+
+#define ALLOW 1
+#define BLOCK 2
+
+struct ip_key {
+    union {
+        __be32 v4_addr;
+        __u8 v6_addr[18];
+    };
+    __u8 family;
+};
+
+struct port_key {
+    __be16 port; // see /usr/include/linux/{tcp,udp}.h, and the dest
+    __u8 family;
+};
+
+// Map for Ingress/Egress Data
+BPF_HASH(direction_list, struct ip_key, uint8_t);
+
+// Map for IP Blocks
+BPF_HASH(ip_list, struct ip_key, uint8_t);
+
+// Map for Port Blocks
+BPF_HASH(port_list, struct port_key, uint8_t);
+
+int fastdrop(struct xdp_md *ctx) {
+    void * data = (void*)(long)ctx->data;
+    void * data_end = (void*)(long)ctx->data_end;
+    u16 eth_type;
+
+    struct ethhdr *eth = data;
+    if ((void*)eth + sizeof(*eth) <= data_end) {
+
+        struct iphdr *ip = data + sizeof(*eth);
+        if ((void*)ip + sizeof(*ip) <= data_end) {
+
+            // Set eth type, to check for IPv6
+            eth_type = eth->h_proto;
+            
+            // Build Key for Direction and IP Blocking
+            struct ip_key ingress_ip_key = {};
+            struct ip_key block_ip_key = {};
+            
+            if (eth_type == ntohs(ETH_P_IPV6)) {
+                // No IPv6 handling for now
+                return XDP_PASS;
+            } else {
+                //bpf_trace_printk("Accepting packet (%d)\\n", ip->daddr);
+                ingress_ip_key.v4_addr = ip->daddr;
+                ingress_ip_key.family = IPV4_FAMILY;
+                
+                block_ip_key.v4_addr = ip->saddr;
+                block_ip_key.family = IPV4_FAMILY;
+            }            
+           
+            // Skip any Egress Packets
+            uint8_t * direction = direction_list.lookup(&ingress_ip_key);
+            if (direction) {
+                if (*direction != INGRESS) {
+                    // Skipping egress packet
+                    return XDP_PASS;
+                }
+                // No ingress match found
+            } else {
+                // No direction in hash map
+                return XDP_PASS;
+            }
+            
+            // Block IP Check
+            uint8_t * block_ip = ip_list.lookup(&block_ip_key);
+            if (block_ip) {
+                if (*block_ip == BLOCK) {
+                    bpf_trace_printk("Dropping incoming source address: %d\\n", ntohl(block_ip_key.v4_addr));
+                    return XDP_DROP;
+                }
+            }
+
+            // Port Check
+            ////// UDP Port Check /////////
+            if (ip->protocol == IPPROTO_UDP) {
+                struct udphdr *udp = (void*)ip + sizeof(*ip);
+                if ((void*)udp + sizeof(*udp) <= data_end) {
+                    struct port_key port_check = {};
+                    port_check.port = udp->dest;
+                    port_check.family = PORT_UDP;
+                    uint8_t * ret = port_list.lookup(&port_check);
+                    if (ret) {
+                        if (*ret == ALLOW) {
+                            bpf_trace_printk("Allowing UDP ingress on port %d\\n", ntohs(udp->dest));
+                            return XDP_PASS;
+                        }
+                    }
+                    
+                    if (ntohs(udp->dest) <= 1024) {
+                        bpf_trace_printk("Dropping UDP Packet (port %d)\\n", ntohs(udp->dest));
+                        return XDP_DROP;
+                    }
+                } else {
+                    bpf_trace_printk("Dropping invalid UDP packet!\\n");
+                    return XDP_DROP;
+                }
+            }
+
+            ////// TCP Port Check /////////
+            if (ip->protocol == IPPROTO_TCP) {
+                struct tcphdr *tcp = (void*)ip + sizeof(*ip);
+                if ((void*)tcp + sizeof(*tcp) <= data_end) {
+                    struct port_key port_check = {};
+                    port_check.port = tcp->dest;
+                    port_check.family = PORT_TCP;
+                    uint8_t * ret = port_list.lookup(&port_check);
+                    if (ret) {
+                        if (*ret == ALLOW) {
+                            bpf_trace_printk("Allowing TCP ingress on port %d\\n", ntohs(tcp->dest));
+                            return XDP_PASS;
+                        }
+                    }
+                   
+                    if (ntohs(tcp->dest) <= 1024) {
+                        bpf_trace_printk("Dropping TCP Packet (port %d)\\n", ntohs(tcp->dest));
+                        return XDP_DROP;
+                    }
+                } else {
+                    bpf_trace_printk("Dropping invalid TCP packet!\\n");
+                    return XDP_DROP;
+                }
+            }
+        }
+    }
+
+    return XDP_PASS;
+}
+"""
+
+def ip4tonl(ip):
+    values = ip.split(".")
+    ip_val = (int(values[0]) << 24) + (int(values[1]) << 16) + (int(values[2]) << 8) + (int(values[3]))
+    return socket.htonl(ip_val)
+
+def main(argv):
+    device = "lo"
+    ingress = "127.0.0.1"
+    blocks = None
+    udp_ports = None
+    tcp_ports = None
+
+    try:
+        opts, args = getopt.getopt(argv, "i:e:n:b:u:t:", ["ingress=","egress=","interface=","block=","udpports=","tcpports="])
+    except getopt.GetoptError:
+        print("fastdrop <[-i | --interface=]> <interface>")
+        sys.exit(2)
+
+    for opt, arg in opts:
+        if opt in ("-n", "--interface"):
+            device = arg
+        if opt in ("-i", "--ingress"):
+            ingress = arg
+        if opt in ("-b", "--block"):
+            blocks = arg.split(",")
+        if opt in ("-u", "--udpports"):
+            udp_ports = arg.split(",")
+        if opt in ("-t", "--tcpports"):
+            tcp_ports = arg.split(",")
+
+    b = BPF(text=bpf_text)
+    fastdrop = b.load_func("fastdrop", BPF.XDP)
+
+    print("## Setting up Direction Hash Map")
+    direction_list = b.get_table("direction_list")
+    direction_list.clear()
+    ingress_key = IP_KEY()
+    ingress_key.addr = ADDR()
+    ingress_key.addr.v4_addr = ip4tonl(ingress)
+    ingress_key.family = IPV4_FAMILY
+    direction = INGRESS
+    res = lib.bpf_update_elem(direction_list.map_fd, ctypes.byref(ingress_key), ctypes.byref(direction), 0)
+    print("## Update direction map result: %d" % res)
+    for k in direction_list.keys():
+        val = direction_list.__getitem__(k)
+        print(">>>> Direction Key: addr(network_order): %s fam: %d dir: %d" % (k.v4_addr, k.family, val.value))
+
+    # ip blocks
+    if blocks:
+        print("## Setting up IP Blocks")
+        block_list = b.get_table("ip_list")
+        block_list.clear()
+        for block in blocks:
+            block_key = IP_KEY()
+            block_key.addr = ADDR()
+            block_key.addr.v4_addr = ip4tonl(block)
+            block_key.family = IPV4_FAMILY
+            decision = BLOCK
+            res = lib.bpf_update_elem(block_list.map_fd, ctypes.byref(block_key), ctypes.byref(decision), 0)
+            if res < 0:
+                print(">>>> Error")
+        for k in block_list.keys():
+            val = block_list.__getitem__(k)
+            print(">>>> Block IP: addr(network_order): %d fam: %d decision: %d" % (k.v4_addr, k.family, val.value))
+
+    # Ports
+    print("## Setting up Port Block Hash Map")
+    port_list = b.get_table("port_list")
+    port_list.clear()
+    # UDP Ports
+    if udp_ports:
+        for port in udp_ports:
+            port_key = PORT_KEY()
+            port_key.port = socket.htons(int(port))
+            port_key.family = PORT_UDP
+            allow = ALLOW
+            res = lib.bpf_update_elem(port_list.map_fd, ctypes.byref(port_key), ctypes.byref(allow), 0)
+            if res < 0:
+                print(">>>> Error")
+    # TCP Ports
+    if tcp_ports:
+        for port in tcp_ports:
+            port_key = PORT_KEY()
+            port_key.port = socket.htons(int(port))
+            port_key.family = PORT_TCP
+            allow = ALLOW
+            res = lib.bpf_update_elem(port_list.map_fd, ctypes.byref(port_key), ctypes.byref(allow), 0)
+            if res < 0:
+                print(">>>> Error")
+    for k in port_list.keys():
+        val = port_list.__getitem__(k)
+        print(">>>> Port Key: port(network_order) %d fam: %d allow: %d" % (k.port, k.family, val.value))
+
+    print("\nAttaching FastDrop XDP rule to device: %s" % device)
+    b.attach_xdp(device, fastdrop, 0)
+
+    try:
+        b.trace_print(fmt="PID: {1} => {5}")
+    except KeyboardInterrupt:
+        print("Removing filter from device: %s" % device)
+        pass
+
+    b.remove_xdp(device, 0)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
